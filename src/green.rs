@@ -6,7 +6,7 @@ mod node_cache;
 
 use self::element::GreenElement;
 
-pub(crate) use self::{element::GreenElementRef, node::GreenChild};
+pub(crate) use self::{element::GreenElementRef, node::ChildrenExt};
 
 pub use self::{
     builder::{Checkpoint, GreenNodeBuilder},

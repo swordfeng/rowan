@@ -1,7 +1,7 @@
 use std::{
     borrow::{Borrow, Cow},
     fmt,
-    iter::{self, FusedIterator},
+    iter::{self, FusedIterator, Map},
     mem::{self, ManuallyDrop},
     ops, ptr, slice,
 };
@@ -23,7 +23,7 @@ pub(super) struct GreenNodeHead {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum GreenChild {
+enum GreenChild {
     Node { rel_offset: TextSize, node: GreenNode },
     Token { rel_offset: TextSize, token: GreenToken },
 }
@@ -137,7 +137,12 @@ impl GreenNodeData {
     /// Children of this node.
     #[inline]
     pub fn children(&self) -> Children<'_> {
-        Children { raw: self.slice().iter() }
+        self.children_ext().map(|(el, _)| el)
+    }
+
+    #[inline]
+    pub(crate) fn children_ext(&self) -> ChildrenExt<'_> {
+        ChildrenExt { raw: self.slice().iter().map(|child| (child.as_ref(), child.rel_offset())) }
     }
 
     pub(crate) fn child_at_range(
@@ -253,14 +258,14 @@ impl GreenNode {
 
 impl GreenChild {
     #[inline]
-    pub(crate) fn as_ref(&self) -> GreenElementRef {
+    fn as_ref(&self) -> GreenElementRef<'_> {
         match self {
             GreenChild::Node { node, .. } => NodeOrToken::Node(node),
             GreenChild::Token { token, .. } => NodeOrToken::Token(token),
         }
     }
     #[inline]
-    pub(crate) fn rel_offset(&self) -> TextSize {
+    fn rel_offset(&self) -> TextSize {
         match self {
             GreenChild::Node { rel_offset, .. } | GreenChild::Token { rel_offset, .. } => {
                 *rel_offset
@@ -274,25 +279,33 @@ impl GreenChild {
     }
 }
 
+pub type Children<'a> = Map<ChildrenExt<'a>, fn(<ChildrenExt<'a> as Iterator>::Item) -> GreenElementRef<'a>>;
+
 #[derive(Debug, Clone)]
-pub struct Children<'a> {
-    pub(crate) raw: slice::Iter<'a, GreenChild>,
+pub struct ChildrenExt<'a> {
+    raw: Map<slice::Iter<'a, GreenChild>, fn(&'a GreenChild) -> (GreenElementRef<'a>, TextSize)>,
+}
+
+impl<'a> ChildrenExt<'a> {
+    pub(crate) fn empty() -> Self {
+        ChildrenExt { raw: [].iter().map(|child| (child.as_ref(), child.rel_offset())) }
+    }
 }
 
 // NB: forward everything stable that iter::Slice specializes as of Rust 1.39.0
-impl ExactSizeIterator for Children<'_> {
+impl ExactSizeIterator for ChildrenExt<'_> {
     #[inline(always)]
     fn len(&self) -> usize {
         self.raw.len()
     }
 }
 
-impl<'a> Iterator for Children<'a> {
-    type Item = GreenElementRef<'a>;
+impl<'a> Iterator for ChildrenExt<'a> {
+    type Item = (GreenElementRef<'a>, /* rel_offset */ TextSize);
 
     #[inline]
-    fn next(&mut self) -> Option<GreenElementRef<'a>> {
-        self.raw.next().map(GreenChild::as_ref)
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw.next()
     }
 
     #[inline]
@@ -310,7 +323,7 @@ impl<'a> Iterator for Children<'a> {
 
     #[inline]
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.raw.nth(n).map(GreenChild::as_ref)
+        self.raw.nth(n)
     }
 
     #[inline]
@@ -334,28 +347,16 @@ impl<'a> Iterator for Children<'a> {
     }
 }
 
-impl<'a> DoubleEndedIterator for Children<'a> {
+impl<'a> DoubleEndedIterator for ChildrenExt<'a> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.raw.next_back().map(GreenChild::as_ref)
+        self.raw.next_back()
     }
 
     #[inline]
     fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.raw.nth_back(n).map(GreenChild::as_ref)
-    }
-
-    #[inline]
-    fn rfold<Acc, Fold>(mut self, init: Acc, mut f: Fold) -> Acc
-    where
-        Fold: FnMut(Acc, Self::Item) -> Acc,
-    {
-        let mut accum = init;
-        while let Some(x) = self.next_back() {
-            accum = f(accum, x);
-        }
-        accum
+        self.raw.nth_back(n)
     }
 }
 
-impl FusedIterator for Children<'_> {}
+impl FusedIterator for ChildrenExt<'_> {}
