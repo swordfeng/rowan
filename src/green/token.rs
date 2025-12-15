@@ -1,6 +1,7 @@
 use std::{
     borrow::Borrow,
     fmt,
+    hash::Hash,
     mem::{self, ManuallyDrop},
     ops, ptr,
 };
@@ -29,6 +30,13 @@ pub struct GreenTokenData {
 impl PartialEq for GreenTokenData {
     fn eq(&self, other: &Self) -> bool {
         self.kind() == other.kind() && self.text() == other.text()
+    }
+}
+
+impl Hash for GreenTokenData {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.kind().hash(state);
+        self.text().hash(state);
     }
 }
 

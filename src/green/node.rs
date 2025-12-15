@@ -1,25 +1,83 @@
 use std::{
     borrow::{Borrow, Cow},
     fmt,
-    iter::{self, FusedIterator, Map},
+    hash::Hash,
+    iter::{self, FusedIterator},
     mem::{self, ManuallyDrop},
-    ops, ptr, slice,
+    ops, option, ptr, slice,
 };
 
 use countme::Count;
 
 use crate::{
     arc::{Arc, HeaderSlice, ThinArc},
-    green::{GreenElement, GreenElementRef, SyntaxKind},
     utility_types::static_assert,
     GreenToken, NodeOrToken, TextRange, TextSize,
+    green::{
+        GreenElement, GreenElementRef, SyntaxKind,
+        untagged_element::{ElementTag, UntaggedElement},
+    },
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct GreenNodeHead {
     kind: SyntaxKind,
     text_len: TextSize,
+    first_tag: ElementTag,
+    first_ptr: Option<UntaggedElement>,
     _c: Count<GreenNode>,
+}
+
+impl fmt::Debug for GreenNodeHead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GreenNodeHead")
+            .field("kind", &self.kind)
+            .field("text_len", &self.text_len)
+            .field("first_element", &self.first_ref().map(|el| el.to_owned()))
+            .finish()
+    }
+}
+impl Clone for GreenNodeHead {
+    fn clone(&self) -> Self {
+        let first_ptr = self.first_ref().map(|el| UntaggedElement::from_element(el.to_owned()).1);
+        Self {
+            kind: self.kind,
+            text_len: self.text_len,
+            first_tag: self.first_tag,
+            first_ptr,
+            _c: self._c.clone(),
+        }
+    }
+}
+impl PartialEq for GreenNodeHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.text_len == other.text_len
+            && self.first_ref() == other.first_ref()
+    }
+}
+impl Eq for GreenNodeHead {}
+impl Hash for GreenNodeHead {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.kind.hash(state);
+        self.text_len.hash(state);
+        self.first_ref().hash(state);
+        self._c.hash(state);
+    }
+}
+
+impl GreenNodeHead {
+    fn first_ref(&self) -> Option<GreenElementRef<'_>> {
+        // SAFETY: self.first_ptr is created from element_to_raw (if present)
+        self.first_ptr.as_ref().map(|p| unsafe { p.as_element_ref(self.first_tag) })
+    }
+}
+
+impl Drop for GreenNodeHead {
+    fn drop(&mut self) {
+        // drop first element
+        // SAFETY: self.first_ptr is created from element_to_raw (if present)
+        let _ = self.first_ptr.take().map(|p| unsafe { p.into_element(self.first_tag) });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -40,6 +98,13 @@ pub struct GreenNodeData {
 impl PartialEq for GreenNodeData {
     fn eq(&self, other: &Self) -> bool {
         self.header() == other.header() && self.slice() == other.slice()
+    }
+}
+
+impl Hash for GreenNodeData {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.header().hash(state);
+        self.slice().hash(state);
     }
 }
 
@@ -117,6 +182,7 @@ impl GreenNodeData {
         &self.data.header
     }
 
+    // Note: this does not contain first element
     #[inline]
     fn slice(&self) -> &[GreenChild] {
         self.data.slice()
@@ -141,14 +207,20 @@ impl GreenNodeData {
     }
 
     #[inline]
-    pub(crate) fn children_ext(&self) -> ChildrenExt<'_> {
-        ChildrenExt { raw: self.slice().iter().map(|child| (child.as_ref(), child.rel_offset())) }
+    pub(crate) fn children_ext<'a>(&'a self) -> ChildrenExt<'a> {
+        ChildrenExt::create(self.header().first_ref(), self.slice().iter())
     }
 
     pub(crate) fn child_at_range(
         &self,
         rel_range: TextRange,
     ) -> Option<(usize, TextSize, GreenElementRef<'_>)> {
+        // first check first element
+        if let Some(first_el) = self.header().first_ref() {
+            if TextRange::new(0.into(), first_el.text_len()).contains_range(rel_range) {
+                return Some((0, 0.into(), first_el));
+            }
+        }
         let idx = self
             .slice()
             .binary_search_by(|it| {
@@ -158,7 +230,7 @@ impl GreenNodeData {
             // XXX: this handles empty ranges
             .unwrap_or_else(|it| it.saturating_sub(1));
         let child = &self.slice().get(idx).filter(|it| it.rel_range().contains_range(rel_range))?;
-        Some((idx, child.rel_offset(), child.as_ref()))
+        Some((idx + 1, child.rel_offset(), child.as_ref()))
     }
 
     #[must_use]
@@ -216,7 +288,17 @@ impl GreenNode {
         I::IntoIter: ExactSizeIterator,
     {
         let mut text_len: TextSize = 0.into();
-        let children = children.into_iter().map(|el| {
+        // extract first element
+        let mut iter = children.into_iter();
+        let (first_tag, first_ptr) = match iter.next() {
+            Some(el) => {
+                text_len += el.text_len();
+                let t = UntaggedElement::from_element(el);
+                (t.0, Some(t.1))
+            }
+            None => (ElementTag::Node, None),
+        };
+        let children = iter.map(|el| {
             let rel_offset = text_len;
             text_len += el.text_len();
             match el {
@@ -226,7 +308,7 @@ impl GreenNode {
         });
 
         let data = ThinArc::from_header_and_iter(
-            GreenNodeHead { kind, text_len: 0.into(), _c: Count::new() },
+            GreenNodeHead { kind, text_len: 0.into(), first_tag, first_ptr, _c: Count::new() },
             children,
         );
 
@@ -279,16 +361,28 @@ impl GreenChild {
     }
 }
 
-pub type Children<'a> = Map<ChildrenExt<'a>, fn(<ChildrenExt<'a> as Iterator>::Item) -> GreenElementRef<'a>>;
+pub type Children<'a> =
+    iter::Map<ChildrenExt<'a>, fn(<ChildrenExt<'a> as Iterator>::Item) -> GreenElementRef<'a>>;
+
+type ChildrenExtHead<'a> = option::IntoIter<(GreenElementRef<'a>, TextSize)>;
+type ChildrenExtTail<'a> =
+    iter::Map<slice::Iter<'a, GreenChild>, fn(&'a GreenChild) -> (GreenElementRef<'a>, TextSize)>;
 
 #[derive(Debug, Clone)]
 pub struct ChildrenExt<'a> {
-    raw: Map<slice::Iter<'a, GreenChild>, fn(&'a GreenChild) -> (GreenElementRef<'a>, TextSize)>,
+    raw: std::iter::Chain<ChildrenExtHead<'a>, ChildrenExtTail<'a>>,
+    raw_len: usize,
 }
 
 impl<'a> ChildrenExt<'a> {
+    fn create(head: Option<GreenElementRef<'a>>, tail: slice::Iter<'a, GreenChild>) -> Self {
+        let raw_len = tail.len() + if head.is_some() { 1 } else { 0 };
+        let head_iter: ChildrenExtHead<'a> = head.map(|el| (el, 0.into())).into_iter();
+        let tail_iter: ChildrenExtTail<'a> = tail.map(|child| (child.as_ref(), child.rel_offset()));
+        ChildrenExt { raw: head_iter.chain(tail_iter), raw_len }
+    }
     pub(crate) fn empty() -> Self {
-        ChildrenExt { raw: [].iter().map(|child| (child.as_ref(), child.rel_offset())) }
+        ChildrenExt::create(None, [].iter())
     }
 }
 
@@ -296,7 +390,7 @@ impl<'a> ChildrenExt<'a> {
 impl ExactSizeIterator for ChildrenExt<'_> {
     #[inline(always)]
     fn len(&self) -> usize {
-        self.raw.len()
+        self.raw_len
     }
 }
 

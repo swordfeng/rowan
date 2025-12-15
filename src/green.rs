@@ -3,6 +3,7 @@ mod token;
 mod element;
 mod builder;
 mod node_cache;
+mod untagged_element;
 
 use self::element::GreenElement;
 
