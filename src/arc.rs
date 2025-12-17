@@ -1,19 +1,10 @@
 //! Vendored and stripped down version of triomphe
 use std::{
-    alloc::{self, Layout},
-    cmp::Ordering,
-    hash::{Hash, Hasher},
-    marker::PhantomData,
-    mem::{self, ManuallyDrop},
-    ops::Deref,
-    ptr,
-    sync::atomic::{
+    alloc::{self, Layout}, cmp::Ordering, hash::{Hash, Hasher}, marker::PhantomData, mem::{self, ManuallyDrop, offset_of}, ops::Deref, ptr, sync::atomic::{
         self,
         Ordering::{Acquire, Relaxed, Release},
-    },
+    }
 };
-
-use memoffset::offset_of;
 
 /// A soft limit on the amount of references that may be made to an `Arc`.
 ///
@@ -251,6 +242,15 @@ impl<H, T> HeaderSlice<H, [T]> {
     pub(crate) fn slice(&self) -> &[T] {
         &self.slice
     }
+    pub(crate) fn slice_mut(&mut self) -> &mut [T] {
+        &mut self.slice
+    }
+}
+
+impl<H, T> HeaderSlice<H, [T; 0]> {
+    pub(crate) unsafe fn from_header_ref(header: &H) -> &Self {
+        unsafe { &*(header as *const H).cast::<u8>().sub(offset_of!(Self, header)).cast() }
+    }
 }
 
 impl<H, T> Deref for HeaderSlice<H, [T; 0]> {
@@ -394,6 +394,23 @@ impl<H, T> ThinArc<H, T> {
         }
 
         ThinArc { ptr: unsafe { ptr::NonNull::new_unchecked(ptr) }, phantom: PhantomData }
+    }
+
+    pub(crate) fn into_raw(this: Self) -> *mut HeaderSlice<H, [T; 0]> {
+        let mut this = ManuallyDrop::new(this);
+        // SAFETY: pointee will not be dropped now until converting it back with `from_raw`
+        unsafe {
+             &mut this.ptr.as_mut().data
+        }
+    }
+
+    /// # Safety
+    /// Must ensure ptr is valid - converted with `into_raw`
+    pub(crate) unsafe fn from_raw(ptr: *mut HeaderSlice<H, [T; 0]>) -> Self {
+        unsafe {
+            let ptr = ptr.cast::<u8>().sub(offset_of!(ArcInner<HeaderSlice<H, [T; 0]>>, data)).cast();
+            Self { ptr: ptr::NonNull::new_unchecked(ptr), phantom: PhantomData }
+        }
     }
 }
 

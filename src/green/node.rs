@@ -4,24 +4,22 @@ use std::{
     hash::Hash,
     iter::{self, FusedIterator},
     mem::{self, ManuallyDrop},
-    ops, option, ptr, slice,
+    ops, option, ptr, slice, u32,
 };
 
 use countme::Count;
 
 use crate::{
-    arc::{Arc, HeaderSlice, ThinArc},
-    utility_types::static_assert,
-    GreenToken, NodeOrToken, TextRange, TextSize,
-    green::{
+    GreenToken, GreenTokenData, NodeOrToken, TextRange, TextSize, arc::{Arc, HeaderSlice, ThinArc}, green::{
         GreenElement, GreenElementRef, SyntaxKind,
         untagged_element::{ElementTag, UntaggedElement},
-    },
+    }
 };
 
 pub(super) struct GreenNodeHead {
     kind: SyntaxKind,
     text_len: TextSize,
+    compact: bool,
     first_tag: ElementTag,
     first_ptr: Option<UntaggedElement>,
     _c: Count<GreenNode>,
@@ -38,10 +36,12 @@ impl fmt::Debug for GreenNodeHead {
 }
 impl Clone for GreenNodeHead {
     fn clone(&self) -> Self {
+        // clone first element
         let first_ptr = self.first_ref().map(|el| UntaggedElement::from_element(el.to_owned()).1);
         Self {
             kind: self.kind,
             text_len: self.text_len,
+            compact: self.compact,
             first_tag: self.first_tag,
             first_ptr,
             _c: self._c.clone(),
@@ -85,35 +85,102 @@ enum GreenChild {
     Node { rel_offset: TextSize, node: GreenNode },
     Token { rel_offset: TextSize, token: GreenToken },
 }
-#[cfg(target_pointer_width = "64")]
-static_assert!(mem::size_of::<GreenChild>() == mem::size_of::<usize>() * 2);
 
-type Repr = HeaderSlice<GreenNodeHead, [GreenChild]>;
+const TAG_BITS: usize = 2;
+const TAG_MASK: u32 = (1 << TAG_BITS) - 1;
+#[derive(Debug)]
+struct GreenChildCompact {
+    tag_rel_offset: u32, ptr_offset: i32
+}
+fn ptr_to_offset<T>(align: usize, ptr_base: usize, ptr: *const T) -> i32 {
+    let offset = (unsafe { ptr.byte_offset_from(ptr_base as *const ()) } >> align.trailing_zeros()).try_into().unwrap();
+    assert_eq!(ptr, unsafe { offset_to_ptr(align, ptr_base, offset) });
+    offset
+}
+
+unsafe fn offset_to_ptr<T>(align: usize, ptr_base: usize, offset: i32) -> *const T {
+    unsafe { (ptr_base as *const T).byte_offset((offset as isize) << align.trailing_zeros()) }
+}
+
 type ReprThin = HeaderSlice<GreenNodeHead, [GreenChild; 0]>;
+type ReprCompact = HeaderSlice<GreenNodeHead, [GreenChildCompact; 0]>;
 #[repr(transparent)]
 pub struct GreenNodeData {
-    data: ReprThin,
+    // align GreenNodeData on GreenNodeHead field
+    header: ManuallyDrop<GreenNodeHead>,
 }
 
 impl PartialEq for GreenNodeData {
     fn eq(&self, other: &Self) -> bool {
-        self.header() == other.header() && self.slice() == other.slice()
+        self.kind() == other.kind() && self.children().eq(other.children())
     }
 }
 
 impl Hash for GreenNodeData {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.header().hash(state);
-        self.slice().hash(state);
+        self.kind().hash(state);
+        for child in self.children() {
+            child.hash(state);
+        }
     }
 }
 
 /// Internal node in the immutable tree.
 /// It has other nodes and tokens as children.
-#[derive(Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct GreenNode {
-    ptr: ThinArc<GreenNodeHead, GreenChild>,
+    header_ptr: *const GreenNodeHead,
+}
+
+unsafe impl Send for GreenNode {}
+unsafe impl Sync for GreenNode {}
+impl Clone for GreenNode {
+    fn clone(&self) -> Self {
+        fn clone_inner<H, T>(p: &HeaderSlice<H, [T; 0]>) -> *const H {
+            unsafe {
+                let thin = ThinArc::from_raw(p as *const _ as *mut _);
+                let cloned = ThinArc::into_raw(thin.clone());
+                assert_eq!(p as *const _, &*cloned as *const _);
+                let _ = ManuallyDrop::new(thin);
+                &(*cloned).header as *const H
+            }
+        }
+        match self.outer() {
+            Ok(plain) => Self { header_ptr: clone_inner(plain) },
+            Err(compact) => Self { header_ptr: clone_inner(compact) },
+        }
+    }
+}
+impl PartialEq for GreenNode {
+    fn eq(&self, other: &Self) -> bool {
+        self as &GreenNodeData == other as &GreenNodeData
+    }
+}
+impl Eq for GreenNode {}
+impl Hash for GreenNode {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self as &GreenNodeData).hash(state);
+    }
+}
+
+impl Drop for GreenNode {
+    fn drop(&mut self) {
+        match self.outer() {
+            Ok(plain) => {
+                let _ = unsafe { ThinArc::from_raw((plain as *const ReprThin).cast_mut()) };
+            },
+            Err(compact) => {
+                let ptr_base = self.header.first_ptr.as_ref().map(|e| e.as_usize()).unwrap_or_default();
+                let thin = unsafe { ThinArc::from_raw((compact as *const ReprCompact).cast_mut()) };
+                let mut fat = Arc::from_thin(thin);
+                if let Some(hs) = Arc::get_mut(&mut fat) {
+                    for compact in hs.slice_mut() {
+                        compact.drop_underlying(ptr_base);
+                    }
+                }
+            },
+        }
+    }
 }
 
 impl ToOwned for GreenNodeData {
@@ -179,13 +246,16 @@ impl fmt::Display for GreenNodeData {
 impl GreenNodeData {
     #[inline]
     fn header(&self) -> &GreenNodeHead {
-        &self.data.header
+        &self.header
     }
 
-    // Note: this does not contain first element
-    #[inline]
-    fn slice(&self) -> &[GreenChild] {
-        self.data.slice()
+    fn outer(&self) -> Result<&ReprThin, &ReprCompact> {
+        // SAFETY: checked compact / non-compact
+        if self.header().compact {
+            Err(unsafe { ReprCompact::from_header_ref(self.header()) })
+        } else {
+            Ok(unsafe { ReprThin::from_header_ref(self.header()) })
+        }
     }
 
     /// Kind of this node.
@@ -208,7 +278,13 @@ impl GreenNodeData {
 
     #[inline]
     pub(crate) fn children_ext<'a>(&'a self) -> ChildrenExt<'a> {
-        ChildrenExt::create(self.header().first_ref(), self.slice().iter())
+        match self.outer() {
+            Ok(plain) => ChildrenExt::create(self.header().first_ref(), plain.slice().iter()),
+            Err(compact) => {
+                let ptr_base = self.header.first_ptr.as_ref().map(|e| e.as_usize()).unwrap_or_default();
+                ChildrenExt::create_compact(self.header().first_ref(), compact.slice().iter(), ptr_base)
+            }
+        }
     }
 
     pub(crate) fn child_at_range(
@@ -221,16 +297,39 @@ impl GreenNodeData {
                 return Some((0, 0.into(), first_el));
             }
         }
-        let idx = self
-            .slice()
-            .binary_search_by(|it| {
-                let child_range = it.rel_range();
-                TextRange::ordering(child_range, rel_range)
-            })
-            // XXX: this handles empty ranges
-            .unwrap_or_else(|it| it.saturating_sub(1));
-        let child = &self.slice().get(idx).filter(|it| it.rel_range().contains_range(rel_range))?;
-        Some((idx + 1, child.rel_offset(), child.as_ref()))
+        match self.outer() {
+            Ok(plain) => {
+                let idx = plain
+                    .slice()
+                    .binary_search_by(|it| {
+                        let child_range = it.rel_range();
+                        TextRange::ordering(child_range, rel_range)
+                    })
+                    // XXX: this handles empty ranges
+                    .unwrap_or_else(|it| it.saturating_sub(1));
+                let child = &plain
+                    .slice()
+                    .get(idx)
+                    .filter(|it| it.rel_range().contains_range(rel_range))?;
+                Some((idx + 1, child.rel_offset(), child.as_ref()))
+            }
+            Err(compact) => {
+                let ptr_base = compact.header.first_ptr.as_ref().map(|e| e.as_usize()).unwrap_or_default();
+                let idx = compact
+                    .slice()
+                    .binary_search_by(|it| {
+                        let child_range = it.rel_range(ptr_base);
+                        TextRange::ordering(child_range, rel_range)
+                    })
+                    // XXX: this handles empty ranges
+                    .unwrap_or_else(|it| it.saturating_sub(1));
+                let child = &compact
+                    .slice()
+                    .get(idx)
+                    .filter(|it| it.rel_range(ptr_base).contains_range(rel_range))?;
+                Some((idx + 1, child.rel_offset(), child.as_ref(ptr_base)))
+            },
+        }
     }
 
     #[must_use]
@@ -271,10 +370,10 @@ impl ops::Deref for GreenNode {
 
     #[inline]
     fn deref(&self) -> &GreenNodeData {
+        assert_ne!(self as *const _, ptr::null());
+        // SAFETY: GreenNodeData must be transparent repr for GreenNodeHead
         unsafe {
-            let repr: &Repr = &self.ptr;
-            let repr: &ReprThin = &*(repr as *const Repr as *const ReprThin);
-            mem::transmute::<&ReprThin, &GreenNodeData>(repr)
+            mem::transmute::<&GreenNodeHead, &GreenNodeData>(&*self.header_ptr)
         }
     }
 }
@@ -288,12 +387,14 @@ impl GreenNode {
         I::IntoIter: ExactSizeIterator,
     {
         let mut text_len: TextSize = 0.into();
+        let mut ptr_base = 0usize;
         // extract first element
         let mut iter = children.into_iter();
         let (first_tag, first_ptr) = match iter.next() {
             Some(el) => {
                 text_len += el.text_len();
                 let t = UntaggedElement::from_element(el);
+                ptr_base = t.1.as_usize();
                 (t.0, Some(t.1))
             }
             None => (ElementTag::Node, None),
@@ -301,14 +402,43 @@ impl GreenNode {
         let children = iter.map(|el| {
             let rel_offset = text_len;
             text_len += el.text_len();
+            // match el {
+            //     NodeOrToken::Node(node) => GreenChild::Node { rel_offset, node },
+            //     NodeOrToken::Token(token) => GreenChild::Token { rel_offset, token },
+            // }
+            let rel_offset = u32::from(rel_offset);
+            assert!(rel_offset < (1 << (32 - TAG_BITS)));
+            const ALIGN: usize = mem::align_of::<GreenNodeData>();
+            assert_eq!(ALIGN, mem::align_of::<crate::GreenTokenData>());
             match el {
-                NodeOrToken::Node(node) => GreenChild::Node { rel_offset, node },
-                NodeOrToken::Token(token) => GreenChild::Token { rel_offset, token },
+                NodeOrToken::Node(node) => {
+                    let ptr = GreenNode::into_raw(node).as_ptr();
+                    let tag_rel_offset = (u32::from(rel_offset) << TAG_BITS) + ElementTag::Node as u32;
+                    GreenChildCompact {
+                        tag_rel_offset,
+                        ptr_offset: ptr_to_offset(ALIGN, ptr_base, ptr),
+                    }
+                },
+                NodeOrToken::Token(token) => {
+                    let ptr = GreenToken::into_raw(token).as_ptr();
+                    let tag_rel_offset = (u32::from(rel_offset) << TAG_BITS) + ElementTag::Token as u32;
+                    GreenChildCompact {
+                        tag_rel_offset,
+                        ptr_offset: ptr_to_offset(ALIGN, ptr_base, ptr),
+                    }
+                },
             }
         });
 
         let data = ThinArc::from_header_and_iter(
-            GreenNodeHead { kind, text_len: 0.into(), first_tag, first_ptr, _c: Count::new() },
+            GreenNodeHead {
+                kind,
+                text_len: 0.into(),
+                compact: true,
+                first_tag,
+                first_ptr,
+                _c: Count::new(),
+            },
             children,
         );
 
@@ -320,7 +450,8 @@ impl GreenNode {
             Arc::into_thin(data)
         };
 
-        GreenNode { ptr: data }
+        let header_ptr = unsafe { &(*ThinArc::into_raw(data)).header } as _;
+        GreenNode { header_ptr }
     }
 
     #[inline]
@@ -332,9 +463,9 @@ impl GreenNode {
 
     #[inline]
     pub(crate) unsafe fn from_raw(ptr: ptr::NonNull<GreenNodeData>) -> GreenNode {
-        let arc = Arc::from_raw(&ptr.as_ref().data as *const ReprThin);
-        let arc = mem::transmute::<Arc<ReprThin>, ThinArc<GreenNodeHead, GreenChild>>(arc);
-        GreenNode { ptr: arc }
+        unsafe {
+            GreenNode { header_ptr: &*ptr.as_ref().header }
+        }
     }
 }
 
@@ -361,25 +492,77 @@ impl GreenChild {
     }
 }
 
+impl GreenChildCompact {
+    #[inline]
+    fn as_ref(&self, ptr_base: usize) -> GreenElementRef<'_> {
+        const ALIGN: usize = mem::align_of::<GreenNodeData>();
+        let tag = self.tag_rel_offset & TAG_MASK;
+        if tag == ElementTag::Node as u32 {
+            NodeOrToken::Node(unsafe { &*offset_to_ptr(ALIGN, ptr_base, self.ptr_offset) })
+        } else if tag == ElementTag::Token as u32 {
+            NodeOrToken::Token(unsafe { &*offset_to_ptr(ALIGN, ptr_base, self.ptr_offset) })
+        } else {
+            panic!()
+        }
+    }
+    #[inline]
+    fn drop_underlying(&mut self, ptr_base: usize) {
+        const ALIGN: usize = mem::align_of::<GreenNodeData>();
+        let tag = self.tag_rel_offset & TAG_MASK;
+        unsafe {
+            if tag == ElementTag::Node as u32 {
+                let _ = GreenNode::from_raw(ptr::NonNull::new_unchecked(offset_to_ptr::<GreenNodeData>(ALIGN, ptr_base, self.ptr_offset).cast_mut()));
+            } else if tag == ElementTag::Token as u32 {
+                let _ = GreenToken::from_raw(ptr::NonNull::new_unchecked(offset_to_ptr::<GreenTokenData>(ALIGN, ptr_base, self.ptr_offset).cast_mut()));
+            } else {
+                panic!()
+            }
+        }
+        self.tag_rel_offset = u32::MAX;  // tag is invalid now
+    }
+    #[inline]
+    fn rel_offset(&self) -> TextSize {
+        (self.tag_rel_offset >> TAG_BITS).into()
+    }
+    #[inline]
+    fn rel_range(&self, ptr_base: usize) -> TextRange {
+        let len = self.as_ref(ptr_base).text_len();
+        TextRange::at(self.rel_offset(), len)
+    }
+}
+
 pub type Children<'a> =
     iter::Map<ChildrenExt<'a>, fn(<ChildrenExt<'a> as Iterator>::Item) -> GreenElementRef<'a>>;
 
 type ChildrenExtHead<'a> = option::IntoIter<(GreenElementRef<'a>, TextSize)>;
 type ChildrenExtTail<'a> =
     iter::Map<slice::Iter<'a, GreenChild>, fn(&'a GreenChild) -> (GreenElementRef<'a>, TextSize)>;
+type ChildrenExtTailCompact<'a> =
+    iter::Map<
+        iter::Zip<slice::Iter<'a, GreenChildCompact>, iter::RepeatN<usize>>,
+        fn((&'a GreenChildCompact, usize)) -> (GreenElementRef<'a>, TextSize)>;
 
 #[derive(Debug, Clone)]
-pub struct ChildrenExt<'a> {
-    raw: std::iter::Chain<ChildrenExtHead<'a>, ChildrenExtTail<'a>>,
-    raw_len: usize,
+pub enum ChildrenExt<'a> {
+    Plain {
+        raw: std::iter::Chain<ChildrenExtHead<'a>, ChildrenExtTail<'a>>,
+    },
+    Compact {
+        raw: std::iter::Chain<ChildrenExtHead<'a>, ChildrenExtTailCompact<'a>>,
+    }
 }
 
 impl<'a> ChildrenExt<'a> {
     fn create(head: Option<GreenElementRef<'a>>, tail: slice::Iter<'a, GreenChild>) -> Self {
-        let raw_len = tail.len() + if head.is_some() { 1 } else { 0 };
         let head_iter: ChildrenExtHead<'a> = head.map(|el| (el, 0.into())).into_iter();
         let tail_iter: ChildrenExtTail<'a> = tail.map(|child| (child.as_ref(), child.rel_offset()));
-        ChildrenExt { raw: head_iter.chain(tail_iter), raw_len }
+        ChildrenExt::Plain { raw: head_iter.chain(tail_iter) }
+    }
+    fn create_compact(head: Option<GreenElementRef<'a>>, tail: slice::Iter<'a, GreenChildCompact>, ptr_base: usize) -> Self {
+        let head_iter: ChildrenExtHead<'a> = head.map(|el| (el, 0.into())).into_iter();
+        let tail_len = tail.len();
+        let tail_iter: ChildrenExtTailCompact<'a> = tail.zip(iter::repeat_n(ptr_base, tail_len)).map(|(child, ptr_base)| (child.as_ref(ptr_base), child.rel_offset()));
+        ChildrenExt::Compact { raw: head_iter.chain(tail_iter) }
     }
     pub(crate) fn empty() -> Self {
         ChildrenExt::create(None, [].iter())
@@ -390,7 +573,13 @@ impl<'a> ChildrenExt<'a> {
 impl ExactSizeIterator for ChildrenExt<'_> {
     #[inline(always)]
     fn len(&self) -> usize {
-        self.raw_len
+        let (l, u) = match self {
+            ChildrenExt::Plain { raw, .. } => raw.size_hint(),
+            ChildrenExt::Compact { raw, .. } => raw.size_hint(),
+        };
+        let u = u.expect("iter size overflow");
+        assert_eq!(l, u);
+        l
     }
 }
 
@@ -399,12 +588,18 @@ impl<'a> Iterator for ChildrenExt<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.raw.next()
+        match self {
+            ChildrenExt::Plain { raw, .. } => raw.next(),
+            ChildrenExt::Compact { raw, .. } => raw.next(),
+        }
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.raw.size_hint()
+        match self {
+            ChildrenExt::Plain { raw, .. } => raw.size_hint(),
+            ChildrenExt::Compact { raw, .. } => raw.size_hint(),
+        }
     }
 
     #[inline]
@@ -412,12 +607,18 @@ impl<'a> Iterator for ChildrenExt<'a> {
     where
         Self: Sized,
     {
-        self.raw.count()
+        match self {
+            ChildrenExt::Plain { raw, .. } => raw.count(),
+            ChildrenExt::Compact { raw, .. } => raw.count(),
+        }
     }
 
     #[inline]
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.raw.nth(n)
+        match self {
+            ChildrenExt::Plain { raw, .. } => raw.nth(n),
+            ChildrenExt::Compact { raw, .. } => raw.nth(n),
+        }
     }
 
     #[inline]
@@ -444,12 +645,18 @@ impl<'a> Iterator for ChildrenExt<'a> {
 impl<'a> DoubleEndedIterator for ChildrenExt<'a> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.raw.next_back()
+        match self {
+            ChildrenExt::Plain { raw, .. } => raw.next_back(),
+            ChildrenExt::Compact { raw, .. } => raw.next_back(),
+        }
     }
 
     #[inline]
     fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.raw.nth_back(n)
+        match self {
+            ChildrenExt::Plain { raw, .. } => raw.nth_back(n),
+            ChildrenExt::Compact { raw, .. } => raw.nth_back(n),
+        }
     }
 }
 

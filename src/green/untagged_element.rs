@@ -59,4 +59,9 @@ impl UntaggedElement {
             }
         }
     }
+
+    #[inline]
+    pub(super) fn as_usize(&self) -> usize {
+        self.0.as_ptr() as usize
+    }
 }

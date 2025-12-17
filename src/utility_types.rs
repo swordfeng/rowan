@@ -155,8 +155,6 @@ macro_rules! _static_assert {
     };
 }
 
-pub(crate) use _static_assert as static_assert;
-
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum Delta<T> {
     Add(T),

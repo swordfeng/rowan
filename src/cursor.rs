@@ -95,11 +95,11 @@ use std::{
 use countme::Count;
 
 use crate::{
+    Direction, GreenNode, GreenToken, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset,
+    WalkEvent,
     green::{ChildrenExt, GreenElementRef, GreenNodeData, GreenTokenData, SyntaxKind},
     sll,
     utility_types::Delta,
-    Direction, GreenNode, GreenToken, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset,
-    WalkEvent,
 };
 
 enum Green {
@@ -640,27 +640,35 @@ impl SyntaxNode {
     pub fn first_child(&self) -> Option<SyntaxNode> {
         self.green_ref().children_ext().enumerate().find_map(|(index, (child, rel_offset))| {
             child.into_node().map(|green| {
-                SyntaxNode::new_child(
-                    green,
-                    self.clone(),
-                    index as u32,
-                    self.offset() + rel_offset,
-                )
+                SyntaxNode::new_child(green, self.clone(), index as u32, self.offset() + rel_offset)
+            })
+        })
+    }
+
+    pub fn first_child_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxNode> {
+        self.green_ref().children_ext().enumerate().find_map(|(index, (child, rel_offset))| {
+            if !matcher(child.kind()) {
+                return None;
+            }
+            child.into_node().map(|green| {
+                SyntaxNode::new_child(green, self.clone(), index as u32, self.offset() + rel_offset)
             })
         })
     }
 
     pub fn last_child(&self) -> Option<SyntaxNode> {
-        self.green_ref().children_ext().enumerate().rev().find_map(|(index, (child, rel_offset))| {
-            child.into_node().map(|green| {
-                SyntaxNode::new_child(
-                    green,
-                    self.clone(),
-                    index as u32,
-                    self.offset() + rel_offset,
-                )
-            })
-        })
+        self.green_ref().children_ext().enumerate().rev().find_map(
+            |(index, (child, rel_offset))| {
+                child.into_node().map(|green| {
+                    SyntaxNode::new_child(
+                        green,
+                        self.clone(),
+                        index as u32,
+                        self.offset() + rel_offset,
+                    )
+                })
+            },
+        )
     }
 
     pub fn first_child_or_token(&self) -> Option<SyntaxElement> {
@@ -669,15 +677,24 @@ impl SyntaxNode {
         })
     }
 
-    pub fn last_child_or_token(&self) -> Option<SyntaxElement> {
-        self.green_ref().children_ext().enumerate().next_back().map(|(index, (child, rel_offset))| {
-            SyntaxElement::new(
-                child,
-                self.clone(),
-                index as u32,
-                self.offset() + rel_offset,
-            )
+    pub fn first_child_or_token_by_kind(
+        &self,
+        matcher: &impl Fn(SyntaxKind) -> bool,
+    ) -> Option<SyntaxElement> {
+        self.green_ref().children_ext().enumerate().find_map(|(index, (child, rel_offset))| {
+            if !matcher(child.kind()) {
+                return None;
+            }
+            Some(SyntaxElement::new(child, self.clone(), index as u32, self.offset() + rel_offset))
         })
+    }
+
+    pub fn last_child_or_token(&self) -> Option<SyntaxElement> {
+        self.green_ref().children_ext().enumerate().next_back().map(
+            |(index, (child, rel_offset))| {
+                SyntaxElement::new(child, self.clone(), index as u32, self.offset() + rel_offset)
+            },
+        )
     }
 
     pub fn next_sibling(&self) -> Option<SyntaxNode> {
